@@ -145,33 +145,33 @@ type Wheel struct {
 }
 
 func TestSubs(t *testing.T) {
-	s, err := model.New(memory.Config{}, Car{})
+	carModel, err := model.New(memory.Config{}, Car{})
 	if err != nil {
 		t.Fatalf("failed to create model: %v", err)
 	}
 
 	//should not be possible to add a person to a car store
-	if _, err := s.Add(Person{Name: "A"}); err == nil {
+	if _, err := carModel.Add(Person{Name: "A"}); err == nil {
 		t.Fatalf("successfully added person to car store!!!")
 	}
 
 	//add cat without subs
-	cA := s.MustAdd(Car{Make: "A", Model: "1"}).(Car)
-	if s.Count() != 1 {
+	cA := carModel.MustAdd(Car{Make: "A", Model: "1"}).(Car)
+	if carModel.Count() != 1 {
 		t.Fatalf("add -> count != 1")
 	}
 	t.Logf("idA = %v", cA.ItemID)
 
-	cAA := s.Get(cA.ItemID).(Car)
+	cAA := carModel.Get(cA.ItemID).(Car)
 	t.Logf("got cA back: %+v", cAA)
 	if cAA.Make != cA.Make || cAA.Model != cA.Model {
 		t.Fatalf("got back not same: %+v != %+v", cA, cAA)
 	}
 
 	//add car with wheels (subs)
-	cB := s.MustAdd(Car{Make: "B", Model: "2", Wheels: []Wheel{{Name: "w1"}, {Name: "w2"}}}).(Car)
+	cB := carModel.MustAdd(Car{Make: "B", Model: "2", Wheels: []Wheel{{Name: "w1"}, {Name: "w2"}}}).(Car)
 	t.Logf("Added cB: %+v", cB)
-	cBB := s.Get(cB.ItemID)
+	cBB := carModel.Get(cB.ItemID)
 	if cBB == nil {
 		t.Fatalf("Did not get car back")
 	}
@@ -179,5 +179,8 @@ func TestSubs(t *testing.T) {
 	t.Logf("got cB back: %+v", cBBB)
 	if cBBB.Make != cB.Make || cBBB.Model != cB.Model {
 		t.Fatalf("got back not same: %+v != %+v", cB, cBB)
+	}
+	if len(cBBB.Wheels) != 2 {
+		t.Fatalf("retrieved cB has %d instead of 2 wheels", len(cBBB.Wheels))
 	}
 }

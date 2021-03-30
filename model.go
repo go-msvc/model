@@ -2,6 +2,6 @@ package model
 
 type IModel interface {
 	IStore
-	UsedBy(IModel) IModel
+	WithReferenceFrom(IModel) IModel
 	HasReferenceTo(IItemModel, ID) (IItemModel, ID, bool)
 }

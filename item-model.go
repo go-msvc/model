@@ -33,17 +33,27 @@ func MustNew(config IConfig, item IItem, refModels ...IItemModel) IItemModel {
 }
 
 func New(config IConfig, item IItem, refModels ...IItemModel) (IItemModel, error) {
+	itemType := reflect.TypeOf(item)
+	if itemType.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("%v is not a struct", itemType)
+	}
+	if itemType.NumField() < 1 || !itemType.Field(0).Anonymous || itemType.Field(0).Type != reflect.TypeOf(Item{}) {
+		return nil, fmt.Errorf("%v is not a struct starting with anonymous field model.Item", itemType)
+	}
+	return newModel(nil, config, itemType, refModels...)
+}
+
+//before calling this, check that item is struct starting with anonymous Item or Sub field.
+func newModel(parent *itemModel, config IConfig, itemType reflect.Type, refModels ...IItemModel) (*itemModel, error) {
 	m := &itemModel{
 		config:    config,
-		itemType:  reflect.TypeOf(item),
+		parent:    parent,
+		itemType:  itemType,
 		bareType:  reflect.StructOf(nil),
 		values:    []ValueInfo{},
 		refs:      []RefInfo{},
 		subs:      []SubInfo{},
 		bareStore: nil,
-	}
-	if m.itemType.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("%v is not a struct", m.itemType)
 	}
 
 	bareStructFields := []reflect.StructField{}
@@ -64,11 +74,20 @@ func New(config IConfig, item IItem, refModels ...IItemModel) (IItemModel, error
 				Type: f.Type,
 			})
 		case reflect.Struct:
-			if i == 0 && f.Anonymous && f.Type == reflect.TypeOf(Item{}) {
+			if m.parent == nil && i == 0 && f.Anonymous && f.Type == reflect.TypeOf(Item{}) {
 				//this is the embedded Item field for ID, DateCreated and DateModified
 				bareStructFields = append(bareStructFields, reflect.StructField{
 					Anonymous: true,
 					Name:      "Item",
+					Type:      f.Type,
+				})
+				continue
+			}
+			if m.parent != nil && i == 0 && f.Anonymous && f.Type == reflect.TypeOf(Sub{}) {
+				//this is the embedded Sub field for ParentID, DateCreated and DateModified
+				bareStructFields = append(bareStructFields, reflect.StructField{
+					Anonymous: true,
+					Name:      "Sub",
 					Type:      f.Type,
 				})
 				continue
@@ -92,7 +111,7 @@ func New(config IConfig, item IItem, refModels ...IItemModel) (IItemModel, error
 					Type:           f.Type,
 					ItemFieldIndex: []int{i},
 					BareFieldIndex: []int{len(bareStructFields)},
-					RefModel:       refModel.UsedBy(m).(IItemModel),
+					RefModel:       refModel.WithReferenceFrom(m).(IItemModel),
 				})
 				//reference fields only stores the ID in the bare struct
 				bareStructFields = append(bareStructFields, reflect.StructField{
@@ -114,15 +133,19 @@ func New(config IConfig, item IItem, refModels ...IItemModel) (IItemModel, error
 			if subType.NumField() < 1 || !subType.Field(0).Anonymous || subType.Field(0).Type != reflect.TypeOf(Sub{}) {
 				return nil, fmt.Errorf("%v.%s type []%v does not have anonymous model.Sub as first field", m.itemType, f.Name, f.Type.Elem())
 			}
-			//create a sub-store
-			//subStore := m.config.SubStore()
+			//create a model to store the sub items
+			subModel, err := newModel(m, m.config, subType, refModels...)
+			if err != nil {
+				return nil, fmt.Errorf("%v.%s type []%v failed to create sub model: %v", m.itemType, f.Name, subType, err)
+			}
 
 			//sub types are not added to the bare struct, they must be read from a sub-store
 			//describe the sub
 			m.subs = append(m.subs, SubInfo{
 				Name:           f.Name,
-				Type:           f.Type.Elem(),
+				Type:           subType,
 				ItemFieldIndex: []int{i},
+				SubModel:       subModel,
 			})
 		default:
 			return nil, fmt.Errorf("%v.%s is a %v which is not yet supported.", m.itemType, f.Name, f.Type.Kind())
@@ -131,9 +154,16 @@ func New(config IConfig, item IItem, refModels ...IItemModel) (IItemModel, error
 	m.bareType = reflect.StructOf(bareStructFields)
 
 	var err error
-	m.bareStore, err = m.config.ItemStore(reflect.New(m.bareType).Elem().Interface())
-	if err != nil {
-		return nil, fmt.Errorf("failed to create store: %v", err)
+	if parent == nil {
+		m.bareStore, err = m.config.ItemStore(reflect.New(m.bareType).Elem().Interface())
+		if err != nil {
+			return nil, fmt.Errorf("failed to create item store: %v", err)
+		}
+	} else {
+		m.bareStore, err = m.config.SubStore(reflect.New(m.bareType).Elem().Interface())
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sub store: %v", err)
+		}
 	}
 	log.Debugf("model item=%+v bare=%+v", m.itemType, m.bareType)
 	return m, nil
@@ -141,32 +171,34 @@ func New(config IConfig, item IItem, refModels ...IItemModel) (IItemModel, error
 
 type itemModel struct {
 	config    IConfig
+	parent    *itemModel //only defined for sub models
 	itemType  reflect.Type
 	bareType  reflect.Type
 	values    []ValueInfo
 	refs      []RefInfo
 	subs      []SubInfo
-	bareStore IItemStore
-	usedBy    []IModel
+	bareStore IStore
+	refFrom   []IModel
 }
 
 func (m itemModel) String() string {
 	return fmt.Sprintf("ItemModel(%v)", m.itemType)
 }
 
-func (m *itemModel) UsedBy(user IModel) IModel {
-	for _, u := range m.usedBy {
+func (m *itemModel) WithReferenceFrom(user IModel) IModel {
+	for _, u := range m.refFrom {
 		if u == user {
 			return m //already in the list
 		}
 	}
-	m.usedBy = append(m.usedBy, user)
+	m.refFrom = append(m.refFrom, user)
 	return m
 }
 
 func (m itemModel) Type() reflect.Type { return m.itemType }
 
 func (m itemModel) MustAdd(item IItem) IItem {
+	//log.Debugf("model(%v).MustAdd(%T:%+v)", m.itemType, item, item)
 	itemWithID, err := m.Add(item)
 	if err != nil {
 		panic(fmt.Errorf("failed to add: %v", err))
@@ -174,45 +206,81 @@ func (m itemModel) MustAdd(item IItem) IItem {
 	return itemWithID
 }
 
+//Add an item
 func (m itemModel) Add(item IItem) (IItem, error) {
+	//log.Debugf("model(%v).Add(%T:%+v)", m.itemType, item, item)
+	if m.parent != nil {
+		return nil, fmt.Errorf("cannot add item to sub model")
+	}
+	newItem, err := m.add(ID(0), item)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add item: %v", err)
+	}
+	return newItem.(IItem), nil
+}
+
+//add new entry into model store
+//param:
+//	parentID - required for sub, must be omitted for item
+//	item     - IItem or ISub, depending on the type of model
+func (m itemModel) add(parentID ID, item interface{}) (interface{}, error) {
+	log.Debugf("model(%v).add(%T:%+v)", m.itemType, item, item)
 	if reflect.TypeOf(item) != m.itemType {
 		return nil, fmt.Errorf("cannot add (%T), expecting %v", item, m.itemType)
 	}
 
-	bareItem, err := m.bareFromItem(item)
+	bareItemPtrValue, err := m.bareFromItem(item)
 	if err != nil {
 		return nil, fmt.Errorf("failed to define bare item: %v", err)
 	}
-	id, err := m.bareStore.Add(bareItem)
-	if err != nil {
-		return nil, fmt.Errorf("failed to store item: %v", err)
-	}
 
-	//log.Debugf("New Item With ID: (%T)%+v", bareItemPtrValue.Elem().Interface(), bareItemPtrValue.Elem().Interface())
-	//and check that the reference items already exist
-	//note: item ID is set after adding the the store because the store assigns the ID
-
-	// //store sub-items separately using the main item's id
-	// for _, s := range m.subs {
-	// 	sliceValue := v.Field(s.fieldIndex)
-	// 	nrSubs := sliceValue.Len()
-	// 	log.Debugf("Storing %d subs %v...", nrSubs, s.fieldName)
-	// 	for i := 0; i < nrSubs; i++ {
-	// 		subValue := sliceValue.Index(i)
-	// 		if _, err := s.model.Add(subValue.Interface().(ISub)); err != nil {
-	// 			return nil, fmt.Errorf("failed to add %v.%s[%d]: %v", m.Type(), s.fieldName, i, err)
-	// 		}
-	// 	}
-
-	// 	// refID := fieldValue.FieldByIndex([]int{0, 0}).Interface().(ID) //-> model.Item{ItemID int}
-	// 	// refItem := r.model.Get(refID)
-
-	// }
-
-	//make copy of item and set the id
+	//make copy of item so we can set the id assigned by the store
 	itemWithIDPtrValue := reflect.New(m.itemType)
 	itemWithIDPtrValue.Elem().Set(reflect.ValueOf(item))
-	itemWithIDPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(id))
+
+	//add to the store
+	var id ID
+	if m.parent == nil {
+		if parentID > 0 {
+			return nil, fmt.Errorf("parentID specified for item")
+		}
+		id, err = m.bareStore.(IItemStore).Add(bareItemPtrValue.Elem().Interface().(IItem))
+		if err != nil {
+			return nil, fmt.Errorf("failed to store item: %v", err)
+		}
+		itemWithIDPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(id))
+	} else {
+		if parentID <= 0 {
+			return nil, fmt.Errorf("parentID not specified for sub")
+		}
+		bareItemPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(parentID))
+		//itemWithIDPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(parentID))
+		err := m.bareStore.(ISubStore).Add(bareItemPtrValue.Elem().Interface().(ISub))
+		if err != nil {
+			return nil, fmt.Errorf("failed to store sub: %v", err)
+		}
+		id = parentID
+	}
+
+	//store sub-items separately using the main item's id
+	if m.parent != nil && len(m.subs) > 0 {
+		return nil, fmt.Errorf("not yet storing sub-sub items... need complex id")
+	}
+	for _, sub := range m.subs {
+		sliceValue := reflect.ValueOf(item).FieldByIndex(sub.ItemFieldIndex)
+		nrSubs := sliceValue.Len()
+		log.Debugf("Storing %d of %v ...", nrSubs, sub.Name)
+		for i := 0; i < nrSubs; i++ {
+			subValue := sliceValue.Index(i)
+			log.Debugf("Saving %+v", subValue)
+			if _, err := sub.SubModel.add(id, subValue.Interface().(ISub)); err != nil {
+				return nil, fmt.Errorf("failed to add %v.%s[%d]: %v", m.Type(), sub.Name, i, err)
+			}
+		}
+		// refID := fieldValue.FieldByIndex([]int{0, 0}).Interface().(ID) //-> model.Item{ItemID int}
+		// refItem := r.model.Get(refID)
+	}
+
 	return itemWithIDPtrValue.Elem().Interface().(IItem), nil
 } //itemModel.Add()
 
@@ -221,11 +289,11 @@ func (m itemModel) Upd(item IItem) error {
 		return fmt.Errorf("cannot upd %T, expecting %v", item, m.itemType)
 	}
 
-	bareItem, err := m.bareFromItem(item)
+	bareItemPtrValue, err := m.bareFromItem(item)
 	if err != nil {
 		return fmt.Errorf("failed to define bare item: %v", err)
 	}
-	if err = m.bareStore.Upd(bareItem); err != nil {
+	if err = m.bareStore.(IItemStore).Upd(bareItemPtrValue.Elem().Interface()); err != nil {
 		return fmt.Errorf("failed to update item: %v", err)
 	}
 
@@ -254,16 +322,37 @@ func (m itemModel) Upd(item IItem) error {
 } //itemMode.Upd()
 
 func (m itemModel) Get(id ID) IItem {
-	bareItem := m.bareStore.Get(id)
+	if m.parent != nil {
+		panic(fmt.Errorf("model(%v) is sub, replace Get() with GetSubs()", m.itemType))
+	}
+	bareItem := m.bareStore.(IItemStore).Get(id)
 	if bareItem == nil {
 		return nil
 	}
+
 	//got item from store, read referenced items by ID and update in this struct
 	return m.itemFromBareItem(bareItem)
 }
 
+func (m itemModel) GetSubs(parentID ID) []ISub {
+	if m.parent == nil {
+		panic(fmt.Errorf("model(%v) is item, replace GetSubs() with Get()", m.itemType))
+	}
+	bareItems := m.bareStore.(ISubStore).Get(parentID)
+	if bareItems == nil {
+		return nil
+	}
+
+	subs := []ISub{}
+	for _, bareItem := range bareItems {
+		subs = append(subs, m.itemFromBareItem(bareItem).(ISub))
+	}
+	//got item from store, read referenced items by ID and update in this struct
+	return subs
+}
+
 func (m itemModel) GetBy(key map[string]interface{}, limit int) []IItem {
-	bareItems := m.bareStore.GetBy(key, limit)
+	bareItems := m.bareStore.(IItemStore).GetBy(key, limit)
 	if len(bareItems) == 0 {
 		return nil
 	}
@@ -277,9 +366,9 @@ func (m itemModel) GetBy(key map[string]interface{}, limit int) []IItem {
 }
 
 func (m *itemModel) Del(id ID) error {
-	log.Debugf("%T(%v).Del(%v) usedBy=%+v...", m, m.itemType, id, m.usedBy)
+	log.Debugf("%T(%v).Del(%v) refFrom=%+v...", m, m.itemType, id, m.refFrom)
 	//before delete - check that this item is not used by other models
-	for _, u := range m.usedBy {
+	for _, u := range m.refFrom {
 		if userModel, userId, used := u.HasReferenceTo(m, id); used {
 			return fmt.Errorf("cannot delete %v.id=%d because used by %s.%v.id=%d",
 				m.itemType,
@@ -289,7 +378,7 @@ func (m *itemModel) Del(id ID) error {
 				userId)
 		}
 	}
-	return m.bareStore.Del(id)
+	return m.bareStore.(IItemStore).Del(id)
 }
 
 func (m *itemModel) HasReferenceTo(refModel IItemModel, refID ID) (IItemModel, ID, bool) {
@@ -298,7 +387,7 @@ func (m *itemModel) HasReferenceTo(refModel IItemModel, refID ID) (IItemModel, I
 	for _, refInfo := range m.refs {
 		if refInfo.RefModel == refModel {
 			//e.g. get membership where membership.person.id == id
-			bareItems := m.bareStore.GetBy(map[string]interface{}{refInfo.Name: refID}, 1)
+			bareItems := m.bareStore.(IItemStore).GetBy(map[string]interface{}{refInfo.Name: refID}, 1)
 			if len(bareItems) > 0 {
 				log.Debugf("%s.HasReference(%v,%v)->true", m, refModel.Type(), refID)
 				return m, ItemID(bareItems[0]), true
@@ -332,14 +421,16 @@ type SubInfo struct {
 	Name           string
 	Type           reflect.Type
 	ItemFieldIndex []int
+	SubModel       *itemModel
 	//not present in bareType: BareFieldIndex []int
 }
 
 func (m itemModel) itemFromBareItem(bareItem IItem) IItem {
+	id := ItemID(bareItem)
 	bareItemValue := reflect.ValueOf(bareItem)
 	//got bareItem from store: copy ID and values into item
 	newItemPtrValue := reflect.New(m.itemType)
-	newItemPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(ItemID(bareItem)))
+	newItemPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(id))
 	for _, valueInfo := range m.values {
 		newItemPtrValue.Elem().FieldByIndex(valueInfo.BareFieldIndex).Set(bareItemValue.FieldByIndex(valueInfo.BareFieldIndex))
 	}
@@ -350,12 +441,22 @@ func (m itemModel) itemFromBareItem(bareItem IItem) IItem {
 		newItemPtrValue.Elem().FieldByIndex(refInfo.ItemFieldIndex).Set(reflect.ValueOf(refItem))
 	}
 	//read sub-items: TODO
+	for _, subInfo := range m.subs {
+		parentSubs := subInfo.SubModel.GetSubs(id)
+		n := len(parentSubs)
+		arrayType := reflect.ArrayOf(n, subInfo.Type)
+		newSlicePtrValue := reflect.New(arrayType)
+		for i, parentSub := range parentSubs {
+			newSlicePtrValue.Elem().Index(i).Set(reflect.ValueOf(parentSub))
+		}
+		newItemPtrValue.Elem().FieldByIndex(subInfo.ItemFieldIndex).Set(newSlicePtrValue.Elem().Slice(0, n))
+	}
 	return newItemPtrValue.Elem().Interface().(IItem)
 }
 
-func (m itemModel) bareFromItem(item IItem) (IItem, error) {
+func (m itemModel) bareFromItem(item IItem) (bareItemPtrValue reflect.Value, err error) {
 	//create new bareType struct
-	bareItemPtrValue := reflect.New(m.bareType)
+	bareItemPtrValue = reflect.New(m.bareType)
 	//copy id
 	bareItemPtrValue.Elem().FieldByIndex([]int{0, 0}).Set(reflect.ValueOf(ItemID(item)))
 	//copy value fields from item to bare item
@@ -372,20 +473,24 @@ func (m itemModel) bareFromItem(item IItem) (IItem, error) {
 		//read the current value of this refItem from its model
 		refItem := refInfo.RefModel.Get(refID)
 		if refItem == nil {
-			return nil, fmt.Errorf("%v.%s.id=%v not found", m.itemType, refInfo.Name, refID)
+			err = fmt.Errorf("%v.%s.id=%v not found", m.itemType, refInfo.Name, refID)
+			return
 		}
 		//compare specified value with what is in the store
 		//todo: provide option to override this check and only check the ID exists
 		//which is useful when one expect concurrent updates to the ref item that
 		//are not significant to the caller of this function...
 		if refItem != refValue.Interface() {
-			return nil, fmt.Errorf("%v.%s.id=%v: the referenced value inside item: %+v, does not reflect what is stored for that id: %+v", m.itemType, refInfo.Name, refID, refValue.Interface(), refItem)
+			err = fmt.Errorf("%v.%s.id=%v: the referenced value inside item: %+v, does not reflect what is stored for that id: %+v", m.itemType, refInfo.Name, refID, refValue.Interface(), refItem)
+			return
 		}
 		bareItemPtrValue.Elem().FieldByIndex(refInfo.BareFieldIndex).Set(refValue.FieldByIndex([]int{0, 0}))
 	}
-	return bareItemPtrValue.Elem().Interface().(IItem), nil
+	err = nil
+	return
 }
 
 func ItemID(item IItem) ID {
+	//log.Debugf("ItemID(%T:%+v)...", item, item)
 	return reflect.ValueOf(item).FieldByIndex([]int{0, 0}).Interface().(ID)
 }

@@ -9,7 +9,5 @@ func (c Config) ItemStore(item model.IItem) (model.IItemStore, error) {
 }
 
 func (c Config) SubStore(sub model.ISub) (model.ISubStore, error) {
-	panic("NYI")
-	//return nil
-	//return New(sub)
+	return newSubStore(sub)
 }

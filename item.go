@@ -2,7 +2,6 @@ package model
 
 type IItem interface {
 	//ID() ID
-	//	WithID(ID) IItem //must be implemented in user struct
 }
 
 type Item struct {
