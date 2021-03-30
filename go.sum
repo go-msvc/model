@@ -1,0 +1,4 @@
+github.com/go-msvc/msf v0.0.0-20210318082532-03d95ed458b1 h1:yG/5LtayHxW4UwHO/uDm0/KZhIrZbiKEpXeief1440Q=
+github.com/go-msvc/msf v0.0.0-20210318082532-03d95ed458b1/go.mod h1:V0EIPRNqqEX/BDacvbk8Llfcr81MXlXu6QtXi3eRnxU=
+github.com/go-sql-driver/mysql v1.5.0/go.mod h1:DCzpHaOWr8IXmIStZouvnhqoel9Qv2LBy8hT2VhHyBg=
+github.com/mattn/go-sqlite3 v1.14.6/go.mod h1:NyWgC/yNuGj7Q9rpYnZvas74GogHl5/Z4A/KQRfk6bU=
